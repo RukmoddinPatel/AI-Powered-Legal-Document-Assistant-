@@ -1,6 +1,5 @@
 const { DataTypes } = require('sequelize');
 const sequelize = require('../config/db');
-const User = require('./User');
 
 const Document = sequelize.define('Document', {
   id: {
@@ -12,7 +11,7 @@ const Document = sequelize.define('Document', {
     type: DataTypes.INTEGER,
     allowNull: false,
     references: {
-      model: User,
+      model: 'users', // Use string reference instead of model object
       key: 'id'
     }
   },
@@ -183,18 +182,6 @@ const Document = sequelize.define('Document', {
       fields: ['title']
     }
   ]
-});
-
-// Define associations
-Document.belongsTo(User, {
-  foreignKey: 'userId',
-  as: 'user',
-  onDelete: 'CASCADE'
-});
-
-User.hasMany(Document, {
-  foreignKey: 'userId',
-  as: 'documents'
 });
 
 // Instance methods

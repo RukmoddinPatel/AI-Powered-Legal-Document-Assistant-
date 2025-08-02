@@ -8,6 +8,10 @@ require('dotenv').config();
 // Import database connection
 const db = require('./config/db');
 
+
+require('./models/associations'); // This loads the associations
+
+
 // Import routes
 const authRoutes = require('./routes/authRoutes.js');
 const documentRoutes = require('./routes/documentRoutes.js');
