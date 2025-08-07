@@ -1,30 +1,22 @@
 const express = require('express');
-const router = express.Router();
 const multer = require('multer');
-const { extractText, extractFromDocument } = require('../controllers/ocrController');
-const { protect } = require('../middleware/authMiddleware'); // Fixed import
+const { protect } = require('../middleware/authMiddleware');
+const OCR = require('../utils/ocrHelper');
 
-// Configure multer for temporary uploads
-const upload = multer({
-  dest: 'uploads/temp/',
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf'];
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type. Only JPEG, PNG, and PDF files are allowed.'), false);
-    }
-  },
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
+const router = express.Router();
+const upload = multer({ dest: 'uploads/temp/', limits: { fileSize: 10 * 1024 * 1024 } });
+
+router.use(protect);
+
+router.post('/extract', upload.single('document'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    
+    const result = await OCR.extractText(req.file.path, req.file.mimetype.split('/')[1]);
+    res.json({ success: true, extractedText: result.text });
+  } catch (error) {
+    res.status(500).json({ error: 'OCR failed: ' + error.message });
   }
 });
-
-// All OCR routes require authentication
-router.use(protect); // Fixed: use the protect function instead of authMiddleware
-
-// OCR routes
-router.post('/extract', upload.single('document'), extractText);
-router.post('/extract/:documentId', extractFromDocument);
 
 module.exports = router;

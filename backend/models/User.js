@@ -11,25 +11,22 @@ const User = sequelize.define('User', {
   name: {
     type: DataTypes.STRING,
     allowNull: false,
-    validate: {
-      notEmpty: true,
-      len: [2, 100]
-    }
+    validate: { len: [2, 100] }
   },
   email: {
     type: DataTypes.STRING,
     allowNull: false,
     unique: true,
-    validate: {
-      isEmail: true
-    }
+    validate: { isEmail: true }
   },
   password: {
     type: DataTypes.STRING,
     allowNull: false,
-    validate: {
-      len: [6, 100]
-    }
+    validate: { len: [6, 100] }
+  },
+  phone: {
+    type: DataTypes.STRING,
+    allowNull: true
   },
   role: {
     type: DataTypes.ENUM('user', 'admin'),
@@ -42,18 +39,9 @@ const User = sequelize.define('User', {
   isVerified: {
     type: DataTypes.BOOLEAN,
     defaultValue: false
-  },
-  phone: {
-    type: DataTypes.STRING,
-    allowNull: true
-  },
-  profileImage: {
-    type: DataTypes.STRING,
-    allowNull: true
   }
 }, {
   tableName: 'users',
-  timestamps: true,
   hooks: {
     beforeCreate: async (user) => {
       if (user.password) {
@@ -68,7 +56,6 @@ const User = sequelize.define('User', {
   }
 });
 
-// Instance methods
 User.prototype.comparePassword = async function(password) {
   return await bcrypt.compare(password, this.password);
 };

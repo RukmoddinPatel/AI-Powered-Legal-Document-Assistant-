@@ -2,316 +2,438 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs-extra');
 const Document = require('../models/Document');
-const { extractText, cleanExtractedText } = require('../utils/ocrHelper');
+const OCR = require('../utils/ocrHelper');
 const OpenAI = require('openai');
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/documents';
-    fs.ensureDirSync(uploadDir);
-    cb(null, uploadDir);
+// Rate limiting and quota management
+const rateLimiter = {
+  requests: new Map(),
+  maxRequestsPerMinute: 3, // Adjust based on your OpenAI plan
+  
+  canMakeRequest: (userId) => {
+    const now = Date.now();
+    const userRequests = rateLimiter.requests.get(userId) || [];
+    
+    // Remove requests older than 1 minute
+    const recentRequests = userRequests.filter(time => now - time < 60000);
+    rateLimiter.requests.set(userId, recentRequests);
+    
+    return recentRequests.length < rateLimiter.maxRequestsPerMinute;
   },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const fileFilter = (req, file, cb) => {
-  const allowedTypes = [
-    'application/pdf',
-    'image/jpeg',
-    'image/jpg',
-    'image/png',
-    'text/plain',
-    'application/msword',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-  ];
-
-  if (allowedTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error('Unsupported file type'), false);
+  
+  recordRequest: (userId) => {
+    const userRequests = rateLimiter.requests.get(userId) || [];
+    userRequests.push(Date.now());
+    rateLimiter.requests.set(userId, userRequests);
   }
 };
 
+// File upload config
 const upload = multer({
-  storage,
-  fileFilter,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
+  dest: 'uploads/documents/',
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'text/plain'];
+    cb(null, allowed.includes(file.mimetype));
   }
 });
 
 const uploadDocument = async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    const { title, language = 'en', tags } = req.body;
-    const { uid } = req.user;
-
-    // Extract text from the uploaded document
-    const extractedText = await extractText(
-      req.file.path,
-      req.file.mimetype,
-      language
-    );
-
-    const cleanedText = cleanExtractedText(extractedText);
-
-    // Save document to database
-    const documentId = await Document.create({
-      firebase_uid: uid,
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    
+    const { title, tags } = req.body;
+    
+    // Extract text using OCR
+    const extractedText = await OCR.extractText(req.file.path, req.file.mimetype.split('/')[1]);
+    
+    const doc = await Document.create({
+      userId: req.user.id,
       title: title || req.file.originalname,
-      original_filename: req.file.originalname,
-      file_path: req.file.path,
-      file_type: req.file.mimetype,
-      file_size: req.file.size,
-      language,
-      extracted_text: cleanedText,
+      originalFileName: req.file.originalname,
+      fileName: req.file.filename,
+      filePath: req.file.path,
+      fileType: path.extname(req.file.originalname).slice(1),
+      fileSize: req.file.size,
+      mimeType: req.file.mimetype,
+      originalText: extractedText.text,
+      confidence: extractedText.confidence,
       tags: tags ? JSON.parse(tags) : []
     });
 
     res.status(201).json({
+      success: true,
       message: 'Document uploaded successfully',
-      documentId,
-      extractedTextLength: cleanedText ? cleanedText.length : 0
+      documentId: doc.id,
+      extractedLength: extractedText.text?.length || 0
     });
-
   } catch (error) {
-    console.error('Upload error:', error);
-    
-    // Clean up uploaded file on error
-    if (req.file) {
-      fs.removeSync(req.file.path);
-    }
-
-    res.status(500).json({ error: 'Failed to upload document' });
+    if (req.file) fs.removeSync(req.file.path);
+    res.status(500).json({ error: 'Upload failed: ' + error.message });
   }
 };
 
 const getDocuments = async (req, res) => {
   try {
-    const { uid } = req.user;
     const { page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+    
+    const docs = await Document.findAndCountAll({
+      where: { userId: req.user.id },
+      order: [['createdAt', 'DESC']],
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+      attributes: { exclude: ['originalText', 'simplifiedText'] }
+    });
 
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    const documents = await Document.findByUserId(uid, parseInt(limit), offset);
-
-    res.status(200).json({ documents });
+    res.json({
+      success: true,
+      documents: docs.rows,
+      total: docs.count,
+      page: parseInt(page),
+      totalPages: Math.ceil(docs.count / limit)
+    });
   } catch (error) {
-    console.error('Get documents error:', error);
-    res.status(500).json({ error: 'Failed to fetch documents' });
+    res.status(500).json({ error: 'Fetch failed' });
   }
 };
 
 const getDocument = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { uid } = req.user;
-
-    const document = await Document.findById(id, uid);
-
-    if (!document) {
-      return res.status(404).json({ error: 'Document not found' });
-    }
-
-    res.status(200).json({ document });
+    const doc = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
+    
+    if (!doc) return res.status(404).json({ error: 'Document not found' });
+    
+    res.json({ success: true, document: doc });
   } catch (error) {
-    console.error('Get document error:', error);
-    res.status(500).json({ error: 'Failed to fetch document' });
+    res.status(500).json({ error: 'Fetch failed' });
   }
 };
 
 const searchDocuments = async (req, res) => {
   try {
-    const { uid } = req.user;
-    const { q: query, language } = req.query;
+    const { q: query } = req.query;
+    if (!query) return res.status(400).json({ error: 'Query required' });
 
-    if (!query) {
-      return res.status(400).json({ error: 'Search query is required' });
-    }
+    const docs = await Document.findAll({
+      where: {
+        userId: req.user.id,
+        [Document.sequelize.Sequelize.Op.or]: [
+          { title: { [Document.sequelize.Sequelize.Op.like]: `%${query}%` } },
+          { originalText: { [Document.sequelize.Sequelize.Op.like]: `%${query}%` } }
+        ]
+      },
+      attributes: { exclude: ['originalText', 'simplifiedText'] }
+    });
 
-    const documents = await Document.search(uid, query, language);
-    res.status(200).json({ documents, query });
+    res.json({ success: true, documents: docs, query });
   } catch (error) {
-    console.error('Search documents error:', error);
-    res.status(500).json({ error: 'Failed to search documents' });
+    res.status(500).json({ error: 'Search failed' });
+  }
+};
+
+// Alternative local simplification without OpenAI
+const simplifyDocumentLocal = async (req, res) => {
+  try {
+    const doc = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
+
+    if (!doc) return res.status(404).json({ error: 'Document not found' });
+    if (!doc.originalText) return res.status(400).json({ error: 'No text to simplify' });
+
+    // Basic local simplification (regex-based)
+    let simplified = doc.originalText
+      .replace(/\b(heretofore|hereinafter|whereas|wherefore|hereby|herein|thereof|therein)\b/gi, '')
+      .replace(/\b(pursuant to|in accordance with|notwithstanding)\b/gi, 'according to')
+      .replace(/\b(shall|will)\b/gi, 'must')
+      .replace(/\b(party of the first part|party of the second part)\b/gi, 'party')
+      .replace(/\b(aforementioned|aforesaid)\b/gi, 'mentioned')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    await doc.update({ simplifiedText: simplified });
+
+    res.json({ 
+      success: true, 
+      simplifiedText: simplified,
+      method: 'local',
+      note: 'Simplified using basic text processing due to AI service limitations'
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Local simplification failed: ' + error.message });
   }
 };
 
 const simplifyDocument = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { uid } = req.user;
-    const { language = 'en', complexity = 'simple' } = req.body;
+    console.log('Simplify request received:', {
+      documentId: req.params.id,
+      userId: req.user?.id,
+      body: req.body
+    });
 
-    const document = await Document.findById(id, uid);
-
-    if (!document) {
-      return res.status(404).json({ error: 'Document not found' });
-    }
-
-    if (!document.extracted_text) {
-      return res.status(400).json({ error: 'No text content available for simplification' });
-    }
-
-    // Check if already simplified
-    if (document.simplified_text) {
-      return res.status(200).json({
-        message: 'Document already simplified',
-        simplifiedText: document.simplified_text
+    // Input validation
+    if (!req.params.id) {
+      return res.status(400).json({ 
+        error: 'Document ID is required',
+        details: 'Missing document ID in request parameters'
       });
     }
 
-    const prompt = generateSimplificationPrompt(document.extracted_text, language, complexity);
+    if (!req.user || !req.user.id) {
+      return res.status(401).json({ 
+        error: 'User authentication required',
+        details: 'No authenticated user found in request'
+      });
+    }
 
+    // Check OpenAI API key
+    if (!process.env.OPENAI_API_KEY) {
+      console.log('OpenAI API key not configured, falling back to local simplification');
+      return simplifyDocumentLocal(req, res);
+    }
+
+    // Rate limiting check
+    if (!rateLimiter.canMakeRequest(req.user.id)) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        details: `You can make ${rateLimiter.maxRequestsPerMinute} requests per minute. Please wait before trying again.`,
+        retryAfter: 60
+      });
+    }
+
+    const { complexity = 'simple', fallbackToLocal = false } = req.body;
+    
+    // Validate complexity parameter
+    const validComplexities = ['simple', 'moderate', 'detailed'];
+    if (!validComplexities.includes(complexity)) {
+      return res.status(400).json({
+        error: 'Invalid complexity level',
+        details: `Complexity must be one of: ${validComplexities.join(', ')}`
+      });
+    }
+
+    console.log('Finding document...');
+    const doc = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
+
+    if (!doc) {
+      console.log('Document not found:', req.params.id);
+      return res.status(404).json({ 
+        error: 'Document not found',
+        details: 'Document does not exist or you do not have access to it'
+      });
+    }
+
+    console.log('Document found:', {
+      id: doc.id,
+      title: doc.title,
+      hasOriginalText: !!doc.originalText,
+      originalTextLength: doc.originalText?.length || 0,
+      hasSimplifiedText: !!doc.simplifiedText
+    });
+
+    if (!doc.originalText || doc.originalText.trim().length === 0) {
+      return res.status(400).json({ 
+        error: 'No text to simplify',
+        details: 'Document does not contain extractable text content'
+      });
+    }
+
+    // Return cached simplified text if available
+    if (doc.simplifiedText && doc.simplifiedText.trim().length > 0) {
+      console.log('Returning cached simplified text');
+      return res.json({ 
+        success: true, 
+        simplifiedText: doc.simplifiedText,
+        cached: true
+      });
+    }
+
+    // If fallback is requested, use local simplification
+    if (fallbackToLocal) {
+      console.log('Using local simplification as requested');
+      return simplifyDocumentLocal(req, res);
+    }
+
+    // Record the request for rate limiting
+    rateLimiter.recordRequest(req.user.id);
+
+    // Prepare text for simplification
+    const maxTextLength = 2000; // Conservative limit to reduce token usage
+    const textToSimplify = doc.originalText.substring(0, maxTextLength);
+    
+    if (doc.originalText.length > maxTextLength) {
+      console.log(`Text truncated from ${doc.originalText.length} to ${maxTextLength} characters`);
+    }
+
+    console.log('Calling OpenAI API...');
+    
+    // Enhanced prompt based on complexity level
+    const complexityPrompts = {
+      simple: "Rewrite this legal text using simple, everyday language. Keep it brief:",
+      moderate: "Simplify this legal text for general understanding. Be concise:",
+      detailed: "Simplify this legal text while preserving key information. Be efficient:"
+    };
+
+    const prompt = `${complexityPrompts[complexity]}\n\n${textToSimplify}`;
+    
+    const completion = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        {
+          role: "system",
+          content: "You are a legal document simplification expert. Be concise and clear."
+        },
+        {
+          role: "user", 
+          content: prompt
+        }
+      ],
+      max_tokens: 1000, // Reduced to minimize costs
+      temperature: 0.2, // Lower temperature for consistency
+    });
+
+    if (!completion.choices || completion.choices.length === 0) {
+      throw new Error('No response generated from AI service');
+    }
+
+    const simplified = completion.choices[0].message?.content?.trim();
+    
+    if (!simplified) {
+      throw new Error('Empty response from AI service');
+    }
+
+    console.log('OpenAI response received, length:', simplified.length);
+
+    // Save simplified text to database
     try {
-      const completion = await openai.chat.completions.create({
-        model: "gpt-3.5-turbo",
-        messages: [
-          {
-            role: "system",
-            content: "You are a legal document simplification assistant. Simplify complex legal language while preserving important legal meanings."
-          },
-          {
-            role: "user",
-            content: prompt
-          }
-        ],
-        max_tokens: 2000,
-        temperature: 0.3
-      });
-
-      const simplifiedText = completion.choices[0].message.content.trim();
-
-      // Save simplified text to database
-      await Document.updateSimplifiedText(id, uid, simplifiedText);
-
-      res.status(200).json({
-        message: 'Document simplified successfully',
-        simplifiedText
-      });
-
-    } catch (openaiError) {
-      console.error('OpenAI API error:', openaiError);
-      res.status(500).json({ error: 'Failed to simplify document using AI' });
+      await doc.update({ simplifiedText: simplified });
+      console.log('Simplified text saved to database');
+    } catch (dbError) {
+      console.error('Database update error:', dbError);
     }
+
+    res.json({ 
+      success: true, 
+      simplifiedText: simplified,
+      complexity: complexity,
+      originalLength: doc.originalText.length,
+      simplifiedLength: simplified.length,
+      cached: false,
+      method: 'ai'
+    });
 
   } catch (error) {
-    console.error('Simplify document error:', error);
-    res.status(500).json({ error: 'Failed to simplify document' });
+    console.error('Simplification error:', {
+      message: error.message,
+      stack: error.stack,
+      name: error.name,
+      code: error.code,
+      status: error.status
+    });
+
+    // Handle specific OpenAI errors
+    if (error.code === 'insufficient_quota') {
+      // Offer local fallback for quota exceeded
+      console.log('OpenAI quota exceeded, offering local fallback');
+      return res.status(503).json({
+        error: 'AI service quota exceeded',
+        details: 'Please try again later, upgrade your plan, or use local simplification',
+        fallbackAvailable: true,
+        suggestion: 'Add "fallbackToLocal": true to your request body to use basic simplification'
+      });
+    }
+
+    if (error.code === 'invalid_api_key') {
+      console.log('Invalid OpenAI API key, falling back to local simplification');
+      return simplifyDocumentLocal(req, res);
+    }
+
+    if (error.code === 'rate_limit_exceeded') {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        details: 'Too many requests to AI service. Please wait and try again.',
+        retryAfter: 60,
+        fallbackAvailable: true
+      });
+    }
+
+    // Handle network/timeout errors with fallback
+    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+      console.log('Network error, falling back to local simplification');
+      return simplifyDocumentLocal(req, res);
+    }
+
+    // Generic error response
+    res.status(500).json({ 
+      error: 'Simplification failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'An unexpected error occurred',
+      fallbackAvailable: true
+    });
   }
 };
 
 const downloadDocument = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { uid } = req.user;
-
-    const document = await Document.findById(id, uid);
-
-    if (!document) {
-      return res.status(404).json({ error: 'Document not found' });
+    const doc = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
+    
+    if (!doc || !fs.existsSync(doc.filePath)) {
+      return res.status(404).json({ error: 'File not found' });
     }
 
-    if (!fs.existsSync(document.file_path)) {
-      return res.status(404).json({ error: 'File not found on server' });
-    }
-
-    res.download(document.file_path, document.original_filename);
+    await doc.increment('downloadCount');
+    res.download(doc.filePath, doc.originalFileName);
   } catch (error) {
-    console.error('Download document error:', error);
-    res.status(500).json({ error: 'Failed to download document' });
+    res.status(500).json({ error: 'Download failed' });
   }
 };
 
 const deleteDocument = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { uid } = req.user;
-
-    const document = await Document.findById(id, uid);
-
-    if (!document) {
-      return res.status(404).json({ error: 'Document not found' });
-    }
-
-    // Delete file from filesystem
-    if (fs.existsSync(document.file_path)) {
-      fs.removeSync(document.file_path);
-    }
-
-    // Delete from database
-    await Document.delete(id, uid);
-
-    res.status(200).json({ message: 'Document deleted successfully' });
+    const doc = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
+    
+    if (!doc) return res.status(404).json({ error: 'Document not found' });
+    
+    if (fs.existsSync(doc.filePath)) fs.removeSync(doc.filePath);
+    await doc.destroy();
+    
+    res.json({ success: true, message: 'Document deleted' });
   } catch (error) {
-    console.error('Delete document error:', error);
-    res.status(500).json({ error: 'Failed to delete document' });
+    res.status(500).json({ error: 'Delete failed' });
   }
 };
 
 const getDocumentStats = async (req, res) => {
   try {
-    const { uid } = req.user;
-    const stats = await Document.getStats(uid);
-    res.status(200).json({ stats });
+    const stats = await Document.findOne({
+      where: { userId: req.user.id },
+      attributes: [
+        [Document.sequelize.fn('COUNT', Document.sequelize.col('id')), 'totalDocs'],
+        [Document.sequelize.fn('SUM', Document.sequelize.col('fileSize')), 'totalSize'],
+        [Document.sequelize.fn('SUM', Document.sequelize.col('downloadCount')), 'totalDownloads']
+      ],
+      raw: true
+    });
+
+    res.json({ success: true, stats });
   } catch (error) {
-    console.error('Get document stats error:', error);
-    res.status(500).json({ error: 'Failed to fetch document statistics' });
+    res.status(500).json({ error: 'Stats failed' });
   }
 };
 
-const generateSimplificationPrompt = (text, language, complexity) => {
-  const languageNames = {
-    'en': 'English',
-    'hi': 'Hindi',
-    'bn': 'Bengali',
-    'te': 'Telugu',
-    'ta': 'Tamil',
-    'gu': 'Gujarati',
-    'kn': 'Kannada',
-    'ml': 'Malayalam',
-    'mr': 'Marathi',
-    'pa': 'Punjabi'
-  };
-
-  const complexityLevels = {
-    'simple': 'very simple language suitable for general public',
-    'intermediate': 'moderately simple language for educated readers',
-    'technical': 'simplified but retaining technical accuracy'
-  };
-
-  const targetLanguage = languageNames[language] || 'English';
-  const complexityLevel = complexityLevels[complexity] || 'simple language';
-
-  return `Please simplify the following legal document text. 
-  
-Requirements:
-- Use ${complexityLevel}
-- Respond in ${targetLanguage}
-- Preserve all important legal meanings and obligations
-- Break down complex sentences into simpler ones
-- Explain legal jargon in plain terms
-- Maintain the document structure but make it more readable
-- Keep important dates, names, and numbers intact
-
-Legal Document Text:
-${text.substring(0, 3000)}${text.length > 3000 ? '...' : ''}
-
-Simplified Version:`;
-};
-
 module.exports = {
-  upload,
+  upload: upload.single('document'),
   uploadDocument,
   getDocuments,
   getDocument,
