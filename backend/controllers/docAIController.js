@@ -1,398 +1,392 @@
-// controllers/docAIController.js
-const { Document, DocumentTranslation } = require('../models');
-const translateText = require('../utils/translator');
-const { summarizeDocument, simplifyLegalText, answerDocumentQuestion } = require('../utils/aiHelper');
-const { extractTextFromFile } = require('../utils/documentProcessor');
+const Document = require('../models/Document');
+const OCR = require('../utils/ocrHelper');
+const AIHelper = require('../utils/aiHelper');
+const Translator = require('../utils/translator');
+const { simplifyLegalText } = require('../utils/simplifyLegalText');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs').promises;
 
-class DocAIController {
-  // Translate document
-  async translateDocument(req, res) {
-    try {
-      const { documentId, targetLanguage } = req.body;
-      const userId = req.user.id;
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: async (req, file, cb) => {
+    const uploadPath = 'uploads/documents';
+    await fs.mkdir(uploadPath, { recursive: true });
+    cb(null, uploadPath);
+  },
+  filename: (req, file, cb) => {
+    const uniqueName = Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname);
+    cb(null, uniqueName);
+  }
+});
 
-      const document = await Document.findOne({
-        where: { id: documentId, userId }
-      });
-
-      if (!document) {
-        return res.status(404).json({ error: 'Document not found' });
-      }
-
-      // Check if translation already exists
-      const existingTranslation = await DocumentTranslation.findOne({
-        where: {
-          documentId,
-          targetLanguage,
-          status: 'completed'
-        }
-      });
-
-      if (existingTranslation) {
-        return res.json({
-          success: true,
-          translation: existingTranslation
-        });
-      }
-
-      // Get text to translate
-      let textToTranslate = document.extractedText;
-      if (!textToTranslate) {
-        // Extract text from file if not already extracted
-        textToTranslate = await extractTextFromFile(document.filePath, document.fileType);
-        await document.update({ extractedText: textToTranslate });
-      }
-
-      // Create translation record
-      const translation = await DocumentTranslation.create({
-        documentId,
-        originalLanguage: 'auto', // Auto-detect
-        targetLanguage,
-        originalText: textToTranslate,
-        translatedText: '',
-        status: 'pending'
-      });
-
-      try {
-        // Perform translation
-        const translatedText = await translateText(textToTranslate, targetLanguage);
-        
-        await translation.update({
-          translatedText,
-          status: 'completed',
-          confidence: 0.95 // Default confidence for successful translation
-        });
-
-        res.json({
-          success: true,
-          translation: {
-            id: translation.id,
-            originalText: textToTranslate,
-            translatedText,
-            targetLanguage,
-            status: 'completed'
-          }
-        });
-      } catch (error) {
-        await translation.update({ status: 'failed' });
-        throw error;
-      }
-    } catch (error) {
-      console.error('Translation error:', error);
-      res.status(500).json({ 
-        error: 'Translation failed', 
-        details: error.message 
-      });
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: (req, file, cb) => {
+    const allowed = ['.pdf', '.doc', '.docx', '.txt', '.png', '.jpg', '.jpeg'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (allowed.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only PDF, DOC, DOCX, TXT, and image files allowed.'));
     }
   }
+}).single('document');
 
-  // Summarize document
-  async summarizeDocument(req, res) {
-    try {
-      const { documentId, summaryType = 'brief' } = req.body;
-      const userId = req.user.id;
+// Upload document
+const uploadDocument = async (req, res) => {
+  try {
+    const { title, documentType } = req.body;
+    const file = req.file;
 
-      const document = await Document.findOne({
-        where: { id: documentId, userId }
-      });
-
-      if (!document) {
-        return res.status(404).json({ error: 'Document not found' });
-      }
-
-      // Return existing summary if available
-      if (document.summary && summaryType === 'brief') {
-        return res.json({
-          success: true,
-          summary: document.summary,
-          cached: true
-        });
-      }
-
-      let textToSummarize = document.extractedText;
-      if (!textToSummarize) {
-        textToSummarize = await extractTextFromFile(document.filePath, document.fileType);
-        await document.update({ extractedText: textToSummarize });
-      }
-
-      const summary = await summarizeDocument(textToSummarize, summaryType);
-      
-      // Cache brief summary
-      if (summaryType === 'brief') {
-        await document.update({ summary });
-      }
-
-      res.json({
-        success: true,
-        summary,
-        summaryType,
-        cached: false
-      });
-    } catch (error) {
-      console.error('Summarization error:', error);
-      res.status(500).json({ 
-        error: 'Summarization failed', 
-        details: error.message 
-      });
+    if (!file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
+
+    // Extract text using OCR
+    const fileExt = path.extname(file.originalname).substring(1);
+    const ocrResult = await OCR.extractText(file.path, fileExt);
+
+    // Create document record
+    const document = await Document.create({
+      userId: req.user.id,
+      title: title || file.originalname,
+      originalFileName: file.originalname,
+      fileName: file.filename,
+      filePath: file.path,
+      fileType: fileExt,
+      fileSize: file.size,
+      mimeType: file.mimetype,
+      documentType: documentType || 'other',
+      originalText: ocrResult.text,
+      confidence: ocrResult.confidence,
+      status: 'processed'
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Document uploaded and processed successfully',
+      document: {
+        id: document.id,
+        title: document.title,
+        status: document.status,
+        confidence: document.confidence,
+        wordCount: ocrResult.wordCount
+      }
+    });
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
+};
 
-  // Simplify legal language
-  async simplifyLanguage(req, res) {
-    try {
-      const { documentId, complexityLevel = 'simple' } = req.body;
-      const userId = req.user.id;
+// Get all documents for user
+const getDocuments = async (req, res) => {
+  try {
+    const { page = 1, limit = 10, type, status } = req.query;
+    const offset = (page - 1) * limit;
 
-      const document = await Document.findOne({
-        where: { id: documentId, userId }
-      });
+    const where = { userId: req.user.id };
+    if (type) where.documentType = type;
+    if (status) where.status = status;
 
-      if (!document) {
-        return res.status(404).json({ error: 'Document not found' });
+    const documents = await Document.findAndCountAll({
+      where,
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+      order: [['createdAt', 'DESC']],
+      attributes: { exclude: ['originalText', 'simplifiedText'] }
+    });
+
+    res.json({
+      success: true,
+      documents: documents.rows,
+      pagination: {
+        total: documents.count,
+        page: parseInt(page),
+        pages: Math.ceil(documents.count / limit)
       }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
 
-      // Return existing simplified text if available
-      if (document.simplifiedText && complexityLevel === 'simple') {
-        return res.json({
-          success: true,
-          simplifiedText: document.simplifiedText,
-          cached: true
-        });
-      }
+// Get single document
+const getDocument = async (req, res) => {
+  try {
+    const document = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
 
-      let textToSimplify = document.extractedText;
-      if (!textToSimplify) {
-        textToSimplify = await extractTextFromFile(document.filePath, document.fileType);
-        await document.update({ extractedText: textToSimplify });
-      }
-
-      const simplifiedText = await simplifyLegalText(textToSimplify, complexityLevel);
-      
-      // Cache simple version
-      if (complexityLevel === 'simple') {
-        await document.update({ simplifiedText });
-      }
-
-      res.json({
-        success: true,
-        originalText: textToSimplify,
-        simplifiedText,
-        complexityLevel,
-        cached: false
-      });
-    } catch (error) {
-      console.error('Simplification error:', error);
-      res.status(500).json({ 
-        error: 'Text simplification failed', 
-        details: error.message 
-      });
+    if (!document) {
+      return res.status(404).json({ success: false, message: 'Document not found' });
     }
+
+    res.json({ success: true, document });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
+};
 
-  // Answer questions about document
-  async answerQuestion(req, res) {
-    try {
-      const { documentId, question } = req.body;
-      const userId = req.user.id;
+// Simplify document language
+const simplifyDocument = async (req, res) => {
+  try {
+    const { complexityLevel = 'simple' } = req.body;
+    
+    const document = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
 
-      if (!question || question.trim().length === 0) {
-        return res.status(400).json({ error: 'Question is required' });
-      }
-
-      const document = await Document.findOne({
-        where: { id: documentId, userId }
-      });
-
-      if (!document) {
-        return res.status(404).json({ error: 'Document not found' });
-      }
-
-      let documentText = document.extractedText;
-      if (!documentText) {
-        documentText = await extractTextFromFile(document.filePath, document.fileType);
-        await document.update({ extractedText: documentText });
-      }
-
-      const answer = await answerDocumentQuestion(documentText, question);
-
-      res.json({
-        success: true,
-        question,
-        answer: answer.response,
-        confidence: answer.confidence,
-        sources: answer.sources || []
-      });
-    } catch (error) {
-      console.error('Question answering error:', error);
-      res.status(500).json({ 
-        error: 'Failed to answer question', 
-        details: error.message 
-      });
+    if (!document) {
+      return res.status(404).json({ success: false, message: 'Document not found' });
     }
-  }
 
-  // Get document analysis
-  async analyzeDocument(req, res) {
-    try {
-      const { documentId } = req.params;
-      const userId = req.user.id;
-
-      const document = await Document.findOne({
-        where: { id: documentId, userId },
-        include: [{
-          model: DocumentTranslation,
-          as: 'translations'
-        }]
-      });
-
-      if (!document) {
-        return res.status(404).json({ error: 'Document not found' });
-      }
-
-      let documentText = document.extractedText;
-      if (!documentText) {
-        documentText = await extractTextFromFile(document.filePath, document.fileType);
-        await document.update({ extractedText: documentText });
-      }
-
-      // Perform comprehensive analysis
-      const analysis = {
-        wordCount: documentText.split(/\s+/).length,
-        readabilityScore: calculateReadabilityScore(documentText),
-        keyPhrases: extractKeyPhrases(documentText),
-        documentType: classifyDocument(documentText),
-        complexity: assessComplexity(documentText),
-        summary: document.summary || await summarizeDocument(documentText, 'brief'),
-        translations: document.translations || []
-      };
-
-      res.json({
-        success: true,
-        document: {
-          id: document.id,
-          title: document.title,
-          category: document.category,
-          createdAt: document.createdAt
-        },
-        analysis
-      });
-    } catch (error) {
-      console.error('Document analysis error:', error);
-      res.status(500).json({ 
-        error: 'Document analysis failed', 
-        details: error.message 
-      });
+    if (!document.originalText) {
+      return res.status(400).json({ success: false, message: 'No text available to simplify' });
     }
+
+    // Simplify using AI helper
+    const simplified = await AIHelper.simplifyLegalText(document.originalText, complexityLevel);
+
+    // Update document with simplified text
+    await document.update({ simplifiedText: simplified });
+
+    res.json({
+      success: true,
+      message: 'Document simplified successfully',
+      simplifiedText: simplified,
+      readabilityImprovement: 'Text has been simplified for better understanding'
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
+};
 
-  // Get translation history
-  async getTranslations(req, res) {
-    try {
-      const { documentId } = req.params;
-      const userId = req.user.id;
+// Summarize document
+const summarizeDocument = async (req, res) => {
+  try {
+    const { summaryType = 'brief' } = req.body;
+    
+    const document = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
 
-      const document = await Document.findOne({
-        where: { id: documentId, userId }
-      });
-
-      if (!document) {
-        return res.status(404).json({ error: 'Document not found' });
-      }
-
-      const translations = await DocumentTranslation.findAll({
-        where: { documentId },
-        order: [['createdAt', 'DESC']]
-      });
-
-      res.json({
-        success: true,
-        translations
-      });
-    } catch (error) {
-      console.error('Get translations error:', error);
-      res.status(500).json({ 
-        error: 'Failed to fetch translations', 
-        details: error.message 
-      });
+    if (!document) {
+      return res.status(404).json({ success: false, message: 'Document not found' });
     }
+
+    const summary = await AIHelper.summarizeDocument(document.originalText, summaryType);
+
+    res.json({
+      success: true,
+      summary,
+      summaryType,
+      originalLength: document.originalText?.length || 0
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
-}
+};
 
-// Helper functions
-function calculateReadabilityScore(text) {
-  // Simple Flesch Reading Ease implementation
-  const sentences = text.split(/[.!?]+/).length - 1;
-  const words = text.split(/\s+/).length;
-  const syllables = countSyllables(text);
-  
-  if (sentences === 0 || words === 0) return 0;
-  
-  const score = 206.835 - (1.015 * (words / sentences)) - (84.6 * (syllables / words));
-  return Math.max(0, Math.min(100, Math.round(score)));
-}
+// Translate document
+const translateDocument = async (req, res) => {
+  try {
+    const { targetLanguage, sourceLanguage = 'auto' } = req.body;
+    
+    const document = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
 
-function countSyllables(text) {
-  const words = text.toLowerCase().split(/\s+/);
-  let syllableCount = 0;
-  
-  words.forEach(word => {
-    const vowels = word.match(/[aeiouy]+/g);
-    syllableCount += vowels ? vowels.length : 1;
-  });
-  
-  return syllableCount;
-}
+    if (!document) {
+      return res.status(404).json({ success: false, message: 'Document not found' });
+    }
 
-function extractKeyPhrases(text) {
-  // Simple keyword extraction
-  const words = text.toLowerCase()
-    .replace(/[^\w\s]/g, ' ')
-    .split(/\s+/)
-    .filter(word => word.length > 3);
-  
-  const frequency = {};
-  words.forEach(word => {
-    frequency[word] = (frequency[word] || 0) + 1;
-  });
-  
-  return Object.entries(frequency)
-    .sort(([,a], [,b]) => b - a)
-    .slice(0, 10)
-    .map(([word]) => word);
-}
+    const translation = await Translator.translateLegalDocument(
+      document.originalText, 
+      targetLanguage, 
+      sourceLanguage
+    );
 
-function classifyDocument(text) {
-  const lowerText = text.toLowerCase();
-  
-  if (lowerText.includes('agreement') || lowerText.includes('contract')) {
-    return 'contract';
-  } else if (lowerText.includes('petition') || lowerText.includes('court')) {
-    return 'lawsuit';
-  } else if (lowerText.includes('order') || lowerText.includes('judgment')) {
-    return 'court_order';
-  } else if (lowerText.includes('notice')) {
-    return 'legal_notice';
+    res.json({
+      success: true,
+      translation: translation.translatedText,
+      sourceLanguage: translation.sourceLanguage,
+      targetLanguage: translation.targetLanguage,
+      preservedStructure: translation.preservedStructure
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
-  
-  return 'other';
-}
+};
 
-function assessComplexity(text) {
-  const avgSentenceLength = text.split(/[.!?]+/).reduce((sum, sentence) => {
-    return sum + sentence.split(/\s+/).length;
-  }, 0) / text.split(/[.!?]+/).length;
-  
-  const complexWords = text.split(/\s+/).filter(word => word.length > 6).length;
-  const totalWords = text.split(/\s+/).length;
-  const complexityRatio = complexWords / totalWords;
-  
-  if (avgSentenceLength > 20 || complexityRatio > 0.3) {
-    return 'high';
-  } else if (avgSentenceLength > 15 || complexityRatio > 0.2) {
-    return 'medium';
+// Ask question about document
+const askDocumentQuestion = async (req, res) => {
+  try {
+    const { question } = req.body;
+    
+    const document = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
+
+    if (!document) {
+      return res.status(404).json({ success: false, message: 'Document not found' });
+    }
+
+    const answer = await AIHelper.answerDocumentQuestion(document.originalText, question);
+
+    res.json({
+      success: true,
+      question,
+      answer: answer.response,
+      confidence: answer.confidence,
+      sources: answer.sources
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
-  
-  return 'low';
-}
+};
 
-module.exports = new DocAIController();
+// Search documents
+const searchDocuments = async (req, res) => {
+  try {
+    const { query, type, page = 1, limit = 10 } = req.query;
+    const offset = (page - 1) * limit;
+
+    if (!query) {
+      return res.status(400).json({ success: false, message: 'Search query required' });
+    }
+
+    const where = { 
+      userId: req.user.id,
+      [Op.or]: [
+        { title: { [Op.like]: `%${query}%` } },
+        { originalText: { [Op.like]: `%${query}%` } }
+      ]
+    };
+
+    if (type) where.documentType = type;
+
+    const documents = await Document.findAndCountAll({
+      where,
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+      order: [['createdAt', 'DESC']],
+      attributes: { exclude: ['originalText', 'simplifiedText'] }
+    });
+
+    res.json({
+      success: true,
+      query,
+      documents: documents.rows,
+      pagination: {
+        total: documents.count,
+        page: parseInt(page),
+        pages: Math.ceil(documents.count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Download document
+const downloadDocument = async (req, res) => {
+  try {
+    const document = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
+
+    if (!document) {
+      return res.status(404).json({ success: false, message: 'Document not found' });
+    }
+
+    // Update download count
+    await document.increment('downloadCount');
+
+    res.download(document.filePath, document.originalFileName);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Delete document
+const deleteDocument = async (req, res) => {
+  try {
+    const document = await Document.findOne({
+      where: { id: req.params.id, userId: req.user.id }
+    });
+
+    if (!document) {
+      return res.status(404).json({ success: false, message: 'Document not found' });
+    }
+
+    // Delete file from filesystem
+    try {
+      await fs.unlink(document.filePath);
+    } catch (fileError) {
+      console.warn('Could not delete file:', fileError.message);
+    }
+
+    await document.destroy();
+
+    res.json({ success: true, message: 'Document deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Get document statistics
+const getDocumentStats = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    const stats = await Document.findAll({
+      where: { userId },
+      attributes: [
+        [sequelize.fn('COUNT', sequelize.col('id')), 'totalDocuments'],
+        [sequelize.fn('SUM', sequelize.col('fileSize')), 'totalSize'],
+        [sequelize.fn('SUM', sequelize.col('downloadCount')), 'totalDownloads']
+      ],
+      raw: true
+    });
+
+    const typeStats = await Document.findAll({
+      where: { userId },
+      attributes: [
+        'documentType',
+        [sequelize.fn('COUNT', sequelize.col('id')), 'count']
+      ],
+      group: ['documentType'],
+      raw: true
+    });
+
+    res.json({
+      success: true,
+      stats: {
+        totalDocuments: stats[0].totalDocuments || 0,
+        totalSizeMB: Math.round((stats[0].totalSize || 0) / (1024 * 1024)),
+        totalDownloads: stats[0].totalDownloads || 0,
+        typeBreakdown: typeStats
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+module.exports = {
+  upload,
+  uploadDocument,
+  getDocuments,
+  getDocument,
+  simplifyDocument,
+  summarizeDocument,
+  translateDocument,
+  askDocumentQuestion,
+  searchDocuments,
+  downloadDocument,
+  deleteDocument,
+  getDocumentStats
+};
